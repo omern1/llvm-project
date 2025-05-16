@@ -26,6 +26,7 @@
 #include "llvm/CodeGen/Analysis.h"
 #include "llvm/CodeGen/BranchFoldingPass.h"
 #include "llvm/CodeGen/MBFIWrapper.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -1340,6 +1341,7 @@ static void salvageDebugInfoFromEmptyBlock(const TargetInstrInfo *TII,
       copyDebugInfoToPredecessor(TII, MBB, *PredBB);
 }
 
+__attribute__((optnone))
 bool BranchFolder::OptimizeBlock(MachineBasicBlock *MBB) {
   bool MadeChange = false;
   MachineFunction &MF = *MBB->getParent();
@@ -1547,22 +1549,59 @@ ReoptimizeBlock:
     MachineInstr &TailCall = *MBB->getFirstNonDebugInstr();
     if (TII->isUnconditionalTailCall(TailCall)) {
       SmallVector<MachineBasicBlock *> PredsChanged;
-      for (auto &Pred : MBB->predecessors()) {
+      for (auto *Pred : MBB->predecessors()) {
+        bool HasHotEdges = false;
+        bool IsCurrentEdgeHot = false;
+        for (auto *PredSucc : Pred->successors()) {
+          auto IsEdgeHot = MBPI.isEdgeHot(Pred, PredSucc);
+          HasHotEdges |= IsEdgeHot;
+          if (PredSucc == MBB)
+            IsCurrentEdgeHot = IsEdgeHot;
+        }
+
         MachineBasicBlock *PredTBB = nullptr, *PredFBB = nullptr;
         SmallVector<MachineOperand, 4> PredCond;
         bool PredAnalyzable =
             !TII->analyzeBranch(*Pred, PredTBB, PredFBB, PredCond, true);
 
-        // Only eliminate if MBB == TBB (Taken Basic Block)
-        if (PredAnalyzable && !PredCond.empty() && PredTBB == MBB &&
-            PredTBB != PredFBB) {
-          // The predecessor has a conditional branch to this block which
-          // consists of only a tail call. Try to fold the tail call into the
-          // conditional branch.
+        // Only do this if the current edge is hot and MBB is the fallthrough.
+        bool CanFoldFallThrough =
+            IsCurrentEdgeHot &&
+            (MBB == PredFBB ||
+             (PredFBB == nullptr && Pred->getFallThrough() == MBB));
+        bool ShouldOptForSize =
+            llvm::shouldOptimizeForSize(MBB, PSI, &MBBFreqInfo);
+        // If optimizing for size we do not want PGO to be a concern (but then
+        // we also do not want to fold the fallthrough).
+        bool IsCurrentEdgeHotOrUnknown =
+            (IsCurrentEdgeHot || !HasHotEdges || ShouldOptForSize);
+        // Eliminate if either MBB == TBB (Taken Basic Block) or we can fold the
+        // fallthrough block
+        bool CanFoldAnything = (CanFoldFallThrough || MBB == PredTBB);
+        
+        if (PredAnalyzable && !PredCond.empty() && PredTBB != PredFBB &&
+            IsCurrentEdgeHotOrUnknown && CanFoldAnything) {
+          // To avoid having to rejig the CFG, we're only going to fold the
+          // fallthrough if PredTBB is the layout successor to MBB. If this
+          // isn't the case, we either have to introduce a new branch to PredTBB
+          // or rejig the CFG.
+          //
+          SmallVector<MachineOperand, 4> ReversedCond(PredCond);
+          if (CanFoldFallThrough) {
+            DebugLoc Dl = MBB->findBranchDebugLoc();
+            TII->reverseBranchCondition(ReversedCond);
+            TII->removeBranch(*Pred);
+            TII->insertBranch(*Pred, MBB, PredTBB, ReversedCond, Dl);
+          } else if (MBB != PredTBB) {
+            continue;
+          }
+          PredAnalyzable =
+              !TII->analyzeBranch(*Pred, PredTBB, PredFBB, PredCond, true);
+
           if (TII->canMakeTailCallConditional(PredCond, TailCall)) {
-            // TODO: It would be nice if analyzeBranch() could provide a pointer
-            // to the branch instruction so replaceBranchWithTailCall() doesn't
-            // have to search for it.
+            // TODO: It would be nice if analyzeBranch() could provide a
+            // pointer to the branch instruction so
+            // replaceBranchWithTailCall() doesn't have to search for it.
             TII->replaceBranchWithTailCall(*Pred, PredCond, TailCall);
             PredsChanged.push_back(Pred);
           }
@@ -1573,6 +1612,7 @@ ReoptimizeBlock:
         // block and there is a high risk of regressing code size rather than
         // improving it.
       }
+
       if (!PredsChanged.empty()) {
         NumTailCalls += PredsChanged.size();
         for (auto &Pred : PredsChanged)

@@ -1581,11 +1581,6 @@ ReoptimizeBlock:
         
         if (PredAnalyzable && !PredCond.empty() && PredTBB != PredFBB &&
             IsCurrentEdgeHotOrUnknown && CanFoldAnything) {
-          // To avoid having to rejig the CFG, we're only going to fold the
-          // fallthrough if PredTBB is the layout successor to MBB. If this
-          // isn't the case, we either have to introduce a new branch to PredTBB
-          // or rejig the CFG.
-          //
           SmallVector<MachineOperand, 4> ReversedCond(PredCond);
           if (CanFoldFallThrough) {
             DebugLoc Dl = MBB->findBranchDebugLoc();
@@ -1606,11 +1601,6 @@ ReoptimizeBlock:
             PredsChanged.push_back(Pred);
           }
         }
-        // If the predecessor is falling through to this block, we could reverse
-        // the branch condition and fold the tail call into that. However, after
-        // that we might have to re-arrange the CFG to fall through to the other
-        // block and there is a high risk of regressing code size rather than
-        // improving it.
       }
 
       if (!PredsChanged.empty()) {
